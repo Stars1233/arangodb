@@ -22,6 +22,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 #pragma once
 
+#include "Async/Registry/promise.h"
 #include "Async/Registry/thread_registry.h"
 
 #include <cstdint>
@@ -61,15 +62,17 @@ struct Registry {
      items stay valid during iteration (i.e. are not deleted in the meantime).
    */
   template<typename F>
-  requires std::invocable<F, Promise*>
+  requires std::invocable<F, PromiseSnapshot>
   auto for_promise(F&& function) -> void {
     auto regs = [&] {
       auto guard = std::lock_guard(mutex);
       return registries;
     }();
 
-    for (auto& registry : regs) {
-      registry->for_promise(function);
+    for (auto& registry_weak : regs) {
+      if (auto registry = registry_weak.lock()) {
+        registry->for_promise(function);
+      }
     }
   }
 
@@ -79,11 +82,28 @@ struct Registry {
      New and existing threads will use this new metrics objects.
    */
   auto set_metrics(std::shared_ptr<const Metrics> metrics) -> void {
+    auto guard = std::lock_guard(mutex);
     _metrics = metrics;
   }
 
+  /**
+     Runs an external clean up.
+   */
+  void run_external_cleanup() noexcept {
+    auto regs = [&] {
+      auto guard = std::lock_guard(mutex);
+      return registries;
+    }();
+
+    for (auto& registry_weak : regs) {
+      if (auto registry = registry_weak.lock()) {
+        registry->garbage_collect_external();
+      }
+    }
+  }
+
  private:
-  std::vector<ThreadRegistry*> registries;
+  std::vector<std::weak_ptr<ThreadRegistry>> registries;
   std::mutex mutex;
   std::shared_ptr<const Metrics> _metrics;
 };

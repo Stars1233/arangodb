@@ -423,7 +423,7 @@ exports.runParallelArangoshTests = function (tests, duration, cn) {
 
     // clear failure points
     debug("clearing all potential failure points");
-    exports.clearAllFailurePoints();
+    global.instanceManager.debugClearFailAt();
   
     debug("stopping all test clients");
     // broad cast stop signal
@@ -943,3 +943,11 @@ exports.insertManyDocumentsIntoCollection
   }
 };
 
+exports.executeExternalAndWaitWithSanitizer = function (executable, args, tmpFileName, options = global.instanceManager.options) {
+  let sanHnd = new sanHandler(executable, options);
+  let tmpMgr = new tmpDirMngr(fs.join(tmpFileName), options);
+  sanHnd.detectLogfiles(tmpMgr.tempDir, tmpMgr.tempDir);
+  let actualRc = internal.executeExternalAndWait(executable, args, false, 0, sanHnd.getSanOptions());
+  sanHnd.fetchSanFileAfterExit(actualRc.pid);
+  return actualRc;
+};

@@ -33,6 +33,9 @@ const pu = require('@arangodb/testutils/process-utils');
 const fs = require('fs');
 const { sanHandler } = require('@arangodb/testutils/san-file-handler');
 const executeExternal = internal.executeExternal;
+const { versionHas } = require("@arangodb/test-helper");
+const isCov = versionHas('coverage');
+const isSan = versionHas('tsan') || versionHas('aulsan');
 
 /* Functions: */
 const toArgv = internal.toArgv;
@@ -214,6 +217,11 @@ class ConfigBuilder {
       this.config['--compress-output'] = true;
     }
   }
+  activateVPack() {
+    if (this.type === 'dump') {
+      this.config['--dump-vpack'] = true;
+    }
+  }
   deactivateCompression() {
     if (this.type === 'dump') {
       this.config['--compress-output'] = false;
@@ -342,7 +350,7 @@ function launchInShellBG  (file) {
   const logFile = `file://${file}.log`;
   let moreArgs = {
     'server.database': arango.getDatabaseName(),
-    'server.request-timeout': '30',
+    'server.request-timeout': IM.options.serverRequestTimeout,
     'log.foreground-tty': 'false',
     //'log.level': ['info', 'httpclient=debug', 'V8=debug'],
     'log.output': logFile,
@@ -433,7 +441,7 @@ function launchSnippetInBG (options, snippet, key, cn, single=false) {
   }
   let client = launchInShellBG(file);
   print(`${CYAN}started client with key '${key}', pid ${client.pid}, args: ${JSON.stringify(client.args)}${RESET}`);
-  return { key, file, client };
+  return { key, file, client, done: false };
 }
 
 function joinBGShells (options, clients, waitFor, cn) {
@@ -443,16 +451,21 @@ function joinBGShells (options, clients, waitFor, cn) {
   while (++tries < waitFor) {
     clients.forEach(function (client) {
       if (!client.done) {
-        let status = internal.statusExternal(client.client.pid);
-        if (status.status !== 'RUNNING') {
-          let success = client.client.sh.fetchSanFileAfterExit(client.client.pid);
-          IM.serverCrashedLocal |= success;
-          client.failed = success;
+        client.status = internal.statusExternal(client.client.pid);
+        if (client.status.status !== 'RUNNING') {
+          let failed = client.client.sh.fetchSanFileAfterExit(client.client.pid);
+          IM.serverCrashedLocal |= failed;
+          client.failed = failed;
           client.done = true;
         }
-        if (status.status === 'TERMINATED' && status.exit === 0) {
-          IM.serverCrashedLocal |= client.client.sh.fetchSanFileAfterExit(client.client.pid);
-          client.failed = false;
+        if (client.status === 'TERMINATED') {
+          if (client.exit === 0) {
+            IM.serverCrashedLocal |= client.client.sh.fetchSanFileAfterExit(client.client.pid);
+            client.failed = false;
+          } else {
+            IM.options.cleanup = false;
+            client.failed = true;
+          }
         }
       }
     });
@@ -491,24 +504,26 @@ function cleanupBGShells (clients, cn) {
     const logfile = client.file + '.log';
     if (client.failed) {
       if (fs.exists(logfile)) {
-        print(`${RED}${Date()} test client with pid ${client.client.pid} has failed and wrote logfile: \n${fs.readFileSync(logfile).toString()} ${RESET}`);
+        print(`${RED}${Date()} test client with pid ${client.client.pid} has failed and wrote a logfile: \n${fs.readFileSync(logfile).toString()} ${RESET}`);
       } else {
         print(`${RED}${Date()} test client with pid ${client.client.pid} has failed and did not write a logfile${RESET}`);
       }
+    } else {
+      try {
+        if (IM.options.cleanup) {
+          fs.remove(logfile);
+        }
+      } catch (err) { }
     }
-    try {
-      if (IM.options.cleanup) {
-        fs.remove(logfile);
-      }
-    } catch (err) { }
-
     if (!client.done) {
       // hard-kill all running instances
       try {
         let status = internal.statusExternal(client.client.pid).status;
+        print(`${RED}${Date()} current not done client ${client.client.pid} status: ${status}${RESET}`);
         if (status === 'RUNNING') {
           print(`${RED}${Date()} forcefully killing test client with pid ${client.client.pid} ${db['${cn}'].exists('stop')}\n${JSON.stringify(db['${cn}'].toArray())}`);
           internal.killExternal(client.client.pid, 9 /*SIGKILL*/);
+          client.status = internal.statusExternal(client.client.pid);
         }
       } catch (err) { }
     }
@@ -551,7 +566,7 @@ function rtaMakedata(options, instanceManager, writeReadClean, msg, logFile, mor
     print(argv);
   }
   
-  let timeout = (options.isInstrumented) ? 60 * 26 : 60 * 15;
+  let timeout = (options.isInstrumented) ? 60 * 30 : 60 * 15;
   return pu.executeAndWait(pu.ARANGOSH_BIN, argv, options, 'arangosh', instanceManager.rootDir, options.coreCheck, timeout);
 }
 function rtaWaitShardsInSync(options, instanceManager) {
@@ -574,6 +589,7 @@ function rtaWaitShardsInSync(options, instanceManager) {
     print(myargs);
   }
   let rc = pu.executeAndWait(pu.ARANGOSH_BIN, myargs, options, 'arangosh', instanceManager.rootDir, options.coreCheck);
+  return rc;
 }
 // //////////////////////////////////////////////////////////////////////////////
 // / @brief runs arangoimport
@@ -670,7 +686,6 @@ function runArangoBenchmark (options, instanceInfo, cmds, rootDir, coreCheck = f
     'server.username': options.username,
     'server.password': options.password,
     'server.endpoint': instanceInfo.endpoint,
-    // 'server.request-timeout': 1200 // default now.
     'server.connection-timeout': 10 // 5s default
   };
 
@@ -709,11 +724,13 @@ exports.registerOptions = function(optionsDefaults, optionsDocumentation) {
     'rtasource': fs.makeAbsolute(fs.join('.', '3rdParty', 'rta-makedata')),
     'makedataArgs': undefined,
     'rtaNegFilter': '',
-    'makedataDB': "_system"
+    'makedataDB': "_system",
+    'serverRequestTimeout': (isCov || isSan) ? 30 * 40 : 120
   });
 
   tu.CopyIntoList(optionsDocumentation, [
     ' Client tools options:',
+    '   - `serverRequestTimeout` The http timeout to arangods of any client tool',
     '   - `makedataDB`: Database to run makedata with, defaults to _system',
     '   - `rtasource`: source directory of rta-makedata if not 3rdparty.',
     '   - `rtaNegFilter`: inverse logic to --test.',

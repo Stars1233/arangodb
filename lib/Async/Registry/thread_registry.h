@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <thread>
 #include "fmt/format.h"
 #include "fmt/std.h"
@@ -66,7 +67,8 @@ struct ThreadRegistry : std::enable_shared_from_this<ThreadRegistry> {
      Can only be called on the owning thread, crashes
      otherwise.
    */
-  auto add(Promise* promise) noexcept -> void;
+  auto add_promise(Requester requester, std::source_location location) noexcept
+      -> Promise*;
 
   /**
      Executes a function on each promise in the registry that is not deleted yet
@@ -76,13 +78,13 @@ struct ThreadRegistry : std::enable_shared_from_this<ThreadRegistry> {
      items stay valid during iteration (i.e. are not deleted in the meantime).
    */
   template<typename F>
-  requires std::invocable<F, Promise*>
+  requires std::invocable<F, PromiseSnapshot>
   auto for_promise(F&& function) noexcept -> void {
     auto guard = std::lock_guard(mutex);
     // (2) - this load synchronizes with store in (1) and (3)
     for (auto current = promise_head.load(std::memory_order_acquire);
          current != nullptr; current = current->next) {
-      function(current);
+      function(current->snapshot());
     }
   }
 
@@ -101,8 +103,16 @@ struct ThreadRegistry : std::enable_shared_from_this<ThreadRegistry> {
    */
   auto garbage_collect() noexcept -> void;
 
-  const std::thread::id owning_thread = std::this_thread::get_id();
-  const std::string thread_name;
+  /**
+     Runs external garbage collection.
+
+     This can be called from a different thread. Cannot delete the head of the
+     promise list, calling this will therefore result in at least one
+     ready-for-deletion promise.
+   */
+  auto garbage_collect_external() noexcept -> void;
+
+  ThreadId const thread;
 
  private:
   Registry* registry = nullptr;
@@ -123,12 +133,5 @@ struct ThreadRegistry : std::enable_shared_from_this<ThreadRegistry> {
    */
   auto remove(Promise* promise) -> void;
 };
-
-template<typename Inspector>
-auto inspect(Inspector& f, ThreadRegistry& x) {
-  return f.object(x).fields(
-      f.field("thread_id", fmt::format("{}", x.owning_thread)),
-      f.field("thread_name", x.thread_name));
-}
 
 }  // namespace arangodb::async_registry
