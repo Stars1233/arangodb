@@ -936,7 +936,7 @@ suite (in this case `testTokens`):
 
 Running a test against a server you started (instead of letting the script start its own server):
 
-    scripts/unittest shell_client --test api-batch.js --server tcp://127.0.0.1:8529 --serverRoot /tmp/123
+    scripts/unittest shell_api --test analyzer.js --server tcp://127.0.0.1:8529 --serverRoot /tmp/123
 
 Re-running previously failed tests:
 
@@ -1191,6 +1191,12 @@ Debugging a storage engine:
     (gdb) catch throw
     (gdb) r
     arangod> require("jsunity").runTest("tests/js/client/shell/shell-client.js");
+
+### Filtering GDB stacktraces 
+`scripts/filter_stacktraces.js [list of gdb output files] --extremeVerbosity true`
+- reads `js/client/modules/@arangodb/testutils/filter_gdb_stacks.json` 
+- applies it to all files with the output of gdb with stacktraces, filtering out threads in the json file.
+- `--extremeVerbosity` will print unfiltered stacks in order to ease adding them to `filter_gdb_stacks.json`.
 
 ### Forcing downgrade from VPack to JSON
 

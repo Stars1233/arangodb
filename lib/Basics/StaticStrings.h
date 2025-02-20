@@ -157,6 +157,7 @@ class StaticStrings {
   static std::string const IndexNameEdgeFrom;
   static std::string const IndexNameEdgeTo;
   static std::string const IndexNamePrimary;
+  static std::string const IndexNameVector;
 
   // index hint strings
   static std::string const IndexHintDisableIndex;
@@ -173,7 +174,9 @@ class StaticStrings {
   static std::string const ForceOneShardAttributeValue;
   static std::string const JoinStrategyType;
   static std::string const Algorithm;
-  static std::string const Yen;
+  static std::string const Legacy;
+  static std::string_view constexpr PushDownMaterialization{
+      "pushDownMaterialization"};
 
   // HTTP headers
   static std::string const Accept;
@@ -190,7 +193,6 @@ class StaticStrings {
   static std::string const Async;
   static std::string const AsyncId;
   static std::string const Authorization;
-  static std::string const BatchContentType;
   static std::string const CacheControl;
   static std::string const Chunked;
   static std::string const Close;

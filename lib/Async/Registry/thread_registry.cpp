@@ -21,6 +21,7 @@
 /// @author Julia Volmer
 ////////////////////////////////////////////////////////////////////////////////
 #include "thread_registry.h"
+#include <source_location>
 
 #include "Assertions/ProdAssert.h"
 #include "Async/Registry/Metrics.h"
@@ -28,6 +29,7 @@
 #include "Async/Registry/registry.h"
 #include "Basics/Thread.h"
 #include "Inspection/Format.h"
+#include "Logger/LogMacros.h"
 #include "Metrics/Counter.h"
 #include "Metrics/Gauge.h"
 
@@ -36,16 +38,19 @@ using namespace arangodb::async_registry;
 auto ThreadRegistry::make(std::shared_ptr<const Metrics> metrics,
                           Registry* registry)
     -> std::shared_ptr<ThreadRegistry> {
-  return std::shared_ptr<ThreadRegistry>(new ThreadRegistry{metrics, registry});
+  struct MakeSharedThreadRegistry : ThreadRegistry {
+    MakeSharedThreadRegistry(std::shared_ptr<const Metrics> metrics,
+                             Registry* registry)
+        : ThreadRegistry{metrics, registry} {}
+  };
+  return std::make_shared<MakeSharedThreadRegistry>(metrics, registry);
 }
 
 ThreadRegistry::ThreadRegistry(std::shared_ptr<const Metrics> metrics,
                                Registry* registry)
-    : thread_name{ThreadNameFetcher{}.get()},
-      registry{registry},
-      metrics{metrics} {
-  if (metrics->total_threads != nullptr) {
-    metrics->total_threads->count();
+    : thread{ThreadId::current()}, registry{registry}, metrics{metrics} {
+  if (metrics->threads_total != nullptr) {
+    metrics->threads_total->count();
   }
   if (metrics->running_threads != nullptr) {
     metrics->running_threads->fetch_add(1);
@@ -62,35 +67,43 @@ ThreadRegistry::~ThreadRegistry() noexcept {
   cleanup();
 }
 
-auto ThreadRegistry::add(Promise* promise) noexcept -> void {
-  ADB_PROD_ASSERT(promise != nullptr);
+auto ThreadRegistry::add_promise(Requester requester,
+                                 std::source_location location) noexcept
+    -> Promise* {
   // promise needs to live on the same thread as this registry
-  ADB_PROD_ASSERT(std::this_thread::get_id() == owning_thread)
-      << "ThreadRegistry::add was called from thread "
-      << std::this_thread::get_id()
+  auto current_thread = ThreadId::current();
+  ADB_PROD_ASSERT(current_thread == thread)
+      << "ThreadRegistry::add_promise was called from thread "
+      << fmt::format("{}", current_thread)
       << " but needs to be called from ThreadRegistry's owning thread "
-      << owning_thread << ".";
-  if (metrics->total_functions != nullptr) {
-    metrics->total_functions->count();
+      << fmt::format("{}", thread) << ". " << this;
+  if (metrics->promises_total != nullptr) {
+    metrics->promises_total->count();
   }
   auto current_head = promise_head.load(std::memory_order_relaxed);
-  promise->next = current_head;
-  promise->registry = shared_from_this();
-  promise->thread_name = thread_name;
-  promise->thread_id = owning_thread;
+  auto promise = new Promise{current_head, shared_from_this(), requester,
+                             std::move(location)};
   if (current_head != nullptr) {
     current_head->previous = promise;
   }
   // (1) - this store synchronizes with load in (2)
   promise_head.store(promise, std::memory_order_release);
-  if (metrics->active_functions != nullptr) {
-    metrics->active_functions->fetch_add(1);
+  if (metrics->registered_promises != nullptr) {
+    metrics->registered_promises->fetch_add(1);
   }
+  return promise;
 }
 
 auto ThreadRegistry::mark_for_deletion(Promise* promise) noexcept -> void {
   // makes sure that promise is really in this list
   ADB_PROD_ASSERT(promise->registry.get() == this);
+
+  promise->state.store(State::Deleted);
+
+  // keep a local copy of the shared pointer. This promise might be the
+  // last of the registry.
+  auto self = std::move(promise->registry);
+
   auto current_head = free_head.load(std::memory_order_relaxed);
   do {
     promise->next_to_free = current_head;
@@ -98,19 +111,26 @@ auto ThreadRegistry::mark_for_deletion(Promise* promise) noexcept -> void {
   } while (not free_head.compare_exchange_weak(current_head, promise,
                                                std::memory_order_release,
                                                std::memory_order_acquire));
+  // DO NOT access promise after this line. The owner thread might already
+  // be running a cleanup and promise might be deleted.
 
-  if (metrics->active_functions != nullptr) {
-    metrics->active_functions->fetch_sub(1);
+  if (metrics->registered_promises != nullptr) {
+    metrics->registered_promises->fetch_sub(1);
   }
-  if (metrics->ready_for_deletion_functions != nullptr) {
-    metrics->ready_for_deletion_functions->fetch_add(1);
+  if (metrics->ready_for_deletion_promises != nullptr) {
+    metrics->ready_for_deletion_promises->fetch_add(1);
   }
-  // decrement the registries ref-count
-  promise->registry.reset();
+
+  // self destroyed here. registry might be destroyed here as well.
 }
 
 auto ThreadRegistry::garbage_collect() noexcept -> void {
-  ADB_PROD_ASSERT(std::this_thread::get_id() == owning_thread);
+  auto current_thread = ThreadId::current();
+  ADB_PROD_ASSERT(current_thread == thread)
+      << "ThreadRegistry::garbage_collect was called from thread "
+      << fmt::format("{}", current_thread)
+      << " but needs to be called from ThreadRegistry's owning thread "
+      << fmt::format("{}", thread) << ". " << this;
   auto guard = std::lock_guard(mutex);
   cleanup();
 }
@@ -122,17 +142,61 @@ auto ThreadRegistry::cleanup() noexcept -> void {
   while (next != nullptr) {
     current = next;
     next = next->next_to_free;
-    if (metrics->ready_for_deletion_functions != nullptr) {
-      metrics->ready_for_deletion_functions->fetch_sub(1);
+    if (metrics->ready_for_deletion_promises != nullptr) {
+      metrics->ready_for_deletion_promises->fetch_sub(1);
     }
     remove(current);
-    current->destroy();
+    delete current;
+  }
+}
+
+auto ThreadRegistry::garbage_collect_external() noexcept -> void {
+  // acquire the lock. This prevents the owning thread and the observer
+  // from accessing promises. Note that the owing thread only adds new
+  // promises to the head of the list.
+  auto guard = std::lock_guard(mutex);
+  // we can make the following observation. Once a promise is enqueued in the
+  // list, it previous and next pointer is never updated, except for the current
+  // head element. Also, Promises are only removed, after the mutex has been
+  // acquired. This implies that we can clean up all promises, that are not
+  // in head position right now.
+  Promise* maybe_head_ptr = nullptr;
+  Promise *current,
+      *next = free_head.exchange(nullptr, std::memory_order_acquire);
+  while (next != nullptr) {
+    current = next;
+    next = next->next_to_free;
+    if (current->previous != nullptr) {
+      if (metrics->ready_for_deletion_promises != nullptr) {
+        metrics->ready_for_deletion_promises->fetch_sub(1);
+      }
+      remove(current);
+      delete current;
+    } else {
+      // if this is the head of the promise list, we cannot delete it because
+      // additional promises could have been added in the meantime
+      // (if these new promises would have been marked in the meantime, they
+      // would be in the new free list due to the exchange earlier)
+      ADB_PROD_ASSERT(maybe_head_ptr == nullptr);
+      maybe_head_ptr = current;
+    }
+  }
+  // After the clean up we have to add the potential head back into the free
+  // list.
+  if (maybe_head_ptr) {
+    auto current_head = free_head.load(std::memory_order_relaxed);
+    do {
+      maybe_head_ptr->next_to_free = current_head;
+      // (4) - this compare_exchange_weak synchronizes with exchange in (5)
+    } while (not free_head.compare_exchange_weak(current_head, maybe_head_ptr,
+                                                 std::memory_order_release,
+                                                 std::memory_order_acquire));
   }
 }
 
 auto ThreadRegistry::remove(Promise* promise) -> void {
   auto* next = promise->next;
-  auto* previous = promise->previous;
+  auto* previous = promise->previous.load();
   if (previous == nullptr) {  // promise is current head
     // (3) - this store synchronizes with the load in (2)
     promise_head.store(next, std::memory_order_release);

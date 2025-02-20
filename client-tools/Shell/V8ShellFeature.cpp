@@ -92,6 +92,7 @@ V8ShellFeature::V8ShellFeature(Server& server, std::string const& name)
       _copyInstallation(false),
       _removeCopyInstallation(false),
       _gcInterval(50),
+      _executionDeadline(0),
       _name(name),
       _isolate(nullptr) {
   setOptional(false);
@@ -142,6 +143,13 @@ void V8ShellFeature::collectOptions(std::shared_ptr<ProgramOptions> options) {
       "--javascript.gc-interval",
       "Request-based garbage collection interval (each n-th command).",
       new UInt64Parameter(&_gcInterval));
+
+  options->addOption(
+      "--javascript.execution-deadline",
+      "deadline in seconds. Once reached, calls will throw. "
+      "HTTP timeouts will be adjusted.",
+      new UInt32Parameter(&_executionDeadline),
+      arangodb::options::makeDefaultFlags(arangodb::options::Flags::Uncommon));
 }
 
 void V8ShellFeature::validateOptions(
@@ -708,6 +716,7 @@ bool V8ShellFeature::runScript(std::vector<std::string> const& files,
         LOG_TOPIC("c254f", ERR, arangodb::Logger::FIXME) << exception;
         ok = false;
       }
+    } else {
       ok = TRI_ParseJavaScriptFile(_isolate, file.c_str());
     }
   }
@@ -1115,7 +1124,7 @@ void V8ShellFeature::initGlobals() {
 
   TRI_InitV8Buffer(_isolate);
   TRI_InitV8Utils(_isolate, context, _startupDirectory, modules);
-  TRI_InitV8Deadline(_isolate);
+  TRI_InitV8Deadline(_isolate, _executionDeadline);
   TRI_InitV8Shell(_isolate);
 
   // pager functions (overwrite existing SYS_OUTPUT from InitV8Utils)
